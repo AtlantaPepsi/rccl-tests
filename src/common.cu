@@ -18,6 +18,23 @@
 #include <libgen.h>
 #include "cuda.h"
 
+__global__ static void EmptyKernel() {}
+// Macro for collecting HW_REG_XCC_ID
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+#define GetXccId(val) \
+  asm volatile ("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID)" : "=s" (val));
+#else
+#define GetXccId(val) \
+  val = 0
+#endif
+
+__global__ static void GetXccKernel(int *xccIdPtr)
+{
+  int xccId;
+  GetXccId(xccId);
+  *xccIdPtr = xccId;
+}
+
 //#define DEBUG_PRINT
 
 #include "verifiable.h"
@@ -103,6 +120,7 @@ static int average = 1;
 static int numDevices = 1;
 static int delay_inout_place = 0;
 static int enable_out_of_place = 1;
+static int xccStart = -1;
 
 #define NUM_BLOCKS 32
 
@@ -659,6 +677,16 @@ testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* 
   }
   TESTCHECK(completeColl(args));
 
+  int* xccIdPtr;
+  CUDACHECK(hipHostMalloc((void**)&xccIdPtr, sizeof(int)));
+  if (xccStart != -1) {
+      // Pre-rotate starting XCC to desigated ID (+1)
+      do {
+        GetXccKernel<<<1,1,0>>>(xccIdPtr);
+        CUDACHECK(hipDeviceSynchronize());
+      } while (*xccIdPtr != (xccStart + 1) % 8);
+  }
+
   for (size_t iter = 0; iter < stress_cycles; iter++) {
     if (iter > 0) PRINT("# Testing %lu cycle.\n", iter+1);
     // Benchmark
@@ -673,6 +701,10 @@ testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* 
 	}
         TESTCHECK(BenchTime(args, type, op, root, 1));
         PRINT("\n");
+	if (xccStart != -1) {
+            for (int i = 0; i < 7; i++)
+                EmptyKernel<<<1, 1, 0>>>();
+        }
     }
   }
   return testSuccess;
@@ -815,7 +847,7 @@ int main(int argc, char* argv[]) {
   while(1) {
     int c;
 
-    c = getopt_long(argc, argv, "t:g:b:e:i:f:n:m:w:p:c:o:d:r:z:Y:T:G:C:O:a:y:s:u:h:q:", longopts, &longindex);
+    c = getopt_long(argc, argv, "t:g:b:e:i:f:n:m:w:p:c:o:d:r:z:Y:T:G:C:O:a:y:s:u:h:q:x:", longopts, &longindex);
 
     if (c == -1)
       break;
@@ -920,6 +952,9 @@ int main(int argc, char* argv[]) {
         break;
       case 'q':
         delay_inout_place = (int)strtol(optarg, NULL, 10);
+        break;
+      case 'x':
+        xccStart = (int)strtol(optarg, NULL, 0);
         break;
       case 'h':
       default:
